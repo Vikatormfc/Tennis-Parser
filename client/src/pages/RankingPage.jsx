@@ -17,12 +17,13 @@ export default function RankingPage() {
             <Stack sx={{ my: 4 }} spacing={4}>
                 <Stack spacing={2}>
                     <Typography variant="h4" component="h1" align="center">
-                        Tennis Player Ranking
+                        Tennis Server Rankings
                     </Typography>
                     <Typography variant="p" align="center">
-                        Some description about the ranking system and how it works.
-                        This text can be replaced with any relevant information you want to provide to the users.
-                        It can also include links to more detailed explanations or rules regarding the ranking system.
+                        These rankings reflect the efficiency of tennis players' serves, based on detailed statistical analysis. The methodology evaluates how effectively each player wins points on serve, considering factors such as first and second serve performance. For more details on the calculation, see the{' '}
+                        <a href="/Serve_Analysis_4.html#SERVE-EFFICIENCY" target="_blank" >
+                            Jupyter notebook.
+                        </a>
                     </Typography>
                 </Stack>
                 {

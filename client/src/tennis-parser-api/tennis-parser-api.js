@@ -17,7 +17,7 @@ export default class TennisParserApi {
      * @throws {Error} if the fetch fails or the response is not ok
      */
     async listRankings() {
-        const response = await fetch(`${this.baseUrl}/rankings`);
+        const response = await fetch(`${this.baseUrl}/rankings/server`);
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
