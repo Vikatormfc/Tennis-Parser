@@ -1,7 +1,7 @@
 import RankingPage from './pages/RankingPage';
 
-function App() {
 
+function App() {
   return <RankingPage />;
 }
 
