@@ -79,8 +79,8 @@ export function Model(props) {
           <group name="Area007" position={[-13.993, 6.044, -16.504]} rotation={[-1.762, -0.187, -2.374]} scale={[0.106, 0.349, 0.451]} />
           <group name="Area008" position={[-30.813, 5.915, 15.678]} rotation={[-1.304, 0, 0]} scale={[0.106, 0.349, 0.451]} />
           <group name="Area009" position={[0, 5.915, 1.851]} rotation={[-1.838, 0, -Math.PI]} scale={[0.106, 0.349, 0.451]} />
+          <mesh name="GrassCourt1" geometry={nodes.GrassCourt1.geometry} material={materials.Grass} position={[0, 0, 8.813]} />
           <mesh name="NurbsPath001" geometry={nodes.NurbsPath001.geometry} material={materials['Material.015']} position={[0, 0.175, 8.813]} />
-          <mesh name="Plane001" geometry={nodes.Plane001.geometry} material={materials.Grass} position={[0, 0, 8.813]} />
           <mesh name="Cube001" geometry={nodes.Cube001.geometry} material={materials['paint.005']} position={[-15.375, 0, 17.529]} />
           <mesh name="Cube002" geometry={nodes.Cube002.geometry} material={materials['paint.005']} position={[-15.409, 0.07, 16.428]} />
           <mesh name="Cube003" geometry={nodes.Cube003.geometry} material={materials['paint.005']} position={[-15.405, 1.237, 15.434]} rotation={[Math.PI / 2, 0, 0]} />
@@ -106,7 +106,6 @@ export function Model(props) {
           <mesh name="Cube032" geometry={nodes.Cube032.geometry} material={materials['Material.019']} position={[0, -0.004, -17.324]} rotation={[Math.PI, 0, Math.PI]} />
           <mesh name="Cube033" geometry={nodes.Cube033.geometry} material={materials['Material.019']} position={[15.153, -0.004, -17.287]} rotation={[-Math.PI, Math.PI / 4, -Math.PI]} />
           <mesh name="Cube034" geometry={nodes.Cube034.geometry} material={materials['Material.019']} position={[-15.153, -0.004, -17.287]} rotation={[Math.PI, -Math.PI / 4, Math.PI]} />
-          <mesh name="Cube035" geometry={nodes.Cube035.geometry} material={materials['Material.019']} position={[1.587, 0.01, 1.54]} />
           <mesh name="Cube036" geometry={nodes.Cube036.geometry} material={materials['paint.004']} position={[0, -0.002, 16.208]} rotation={[-0.291, 0, 0]} />
           <mesh name="Cube037" geometry={nodes.Cube037.geometry} material={materials['paint.004']} position={[0, 1.689, 16.257]} />
           <mesh name="Cube038" geometry={nodes.Cube038.geometry} material={materials['paint.004']} position={[0, 0.415, 15.729]} />
@@ -260,8 +259,8 @@ export function Model(props) {
           <mesh name="Torus002" geometry={nodes.Torus002.geometry} material={materials['paint.003']} position={[0, 0.766, -15.282]} rotation={[0, 0, -Math.PI / 2]} />
           <mesh name="Torus003" geometry={nodes.Torus003.geometry} material={materials['metal.002']} position={[0, 0.042, -8.813]} rotation={[0, 0, -Math.PI / 2]} />
         </group>
-        <pointLight name="Light" intensity={54351.413} decay={2} position={[4.076, 5.904, -1.005]} rotation={[-1.839, 0.602, 1.932]} />
-        <directionalLight intensity={2049} decay={2} color="#f6ffc1" rotation={[-Math.PI / 2, 0, 0]} target={nodes.Sun.target}>
+        <pointLight name="Light" intensity={24351.413} decay={2} position={[4.076, 5.904, -1.005]} rotation={[-1.839, 0.602, 1.932]} />
+        <directionalLight intensity={1049} decay={2} color="#f6ffc1" rotation={[-Math.PI / 2, 0, 0]} target={nodes.Sun.target}>
           <primitive object={nodes.Sun.target} position={[0, 0, -1]} />
         </directionalLight>
         <mesh name="Center_Lamppost" geometry={nodes.Center_Lamppost.geometry} material={materials.Material}>

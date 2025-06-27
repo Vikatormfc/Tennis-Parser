@@ -10,7 +10,7 @@ const Scene = () => {
             <Suspense fallback={null}>
                 <Model />
             </Suspense>
-            <ambientLight intensity={10} />
+            {/* <ambientLight intensity={100} /> */}
         </>
     );
 };
