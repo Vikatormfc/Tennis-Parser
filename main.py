@@ -1,4 +1,3 @@
-from typing import Union
 import pandas as pd
 from caseconverter import kebabcase
 
@@ -43,10 +42,3 @@ def read_player(player_slug: str):
         raise HTTPException(status_code=404, detail="Player not found")
 
     return {"player": player_data.to_dict(orient="records")[0]}
-
-
-"""
-[x] 1. Endpoint to fetch player dashboard using a unique player slug.
-2. Link from the ranking table to the player dashboard (on the frontend). Means we need to include the player slug in the rankings data.
-3. Make a simple dashboard page in React with the player stats.
-"""

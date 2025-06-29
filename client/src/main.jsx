@@ -11,7 +11,6 @@ import theme from './theme';
 
 const queryClient = new QueryClient();
 
-
 createRoot(document.getElementById('root')).render(
   <StrictMode>
     <ThemeProvider theme={theme}>
