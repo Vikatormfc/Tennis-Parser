@@ -1,3 +1,5 @@
+const defaultBaseUrl = import.meta.env.VITE_API_URL;
+
 export default class TennisParserApi {
     /**
      * Wrapper for the Tennis Parser API client.
@@ -7,7 +9,7 @@ export default class TennisParserApi {
      * @param {string} options.baseUrl - The base URL for the API. Defaults to an empty string.
      * @constructor 
      */
-    constructor({ baseUrl = '' } = {}) {
+    constructor({ baseUrl = defaultBaseUrl } = {}) {
         this.baseUrl = baseUrl;
     }
 
@@ -23,5 +25,23 @@ export default class TennisParserApi {
         }
         const data = await response.json();
         return data.rankings;
+    }
+
+    async getPlayerDashboard(playerSlug) {
+        const response = await fetch(`${this.baseUrl}/players/${playerSlug}`);
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const data = await response.json();
+        return data.player;
+    }
+
+    async listPlayers() {
+        const response = await fetch(`${this.baseUrl}/players`);
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const data = await response.json();
+        return data.players;
     }
 };

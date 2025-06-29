@@ -1,16 +1,17 @@
+import RankingTable from "@/components/RankingTable";
+import TennisParserApi from "@/tennis-parser-api/tennis-parser-api";
 import Container from '@mui/material/Container';
 import Stack from "@mui/material/Stack";
 import Typography from '@mui/material/Typography';
-import { useQuery } from '@tanstack/react-query';
-import RankingTable from "@/components/RankingTable";
-import useApi from "@/hooks/use-api";
+import { useLoaderData } from 'react-router';
+
+export function loader() {
+    const api = new TennisParserApi();
+    return api.listRankings();
+}
 
 export default function RankingPage() {
-    const api = useApi();
-    const { data: rankings, isLoading, error } = useQuery({
-        queryKey: ['ranking'],
-        queryFn: () => api.listRankings(),
-    });
+    const rankings = useLoaderData();
 
     return (
         <Container maxWidth="md">
@@ -26,10 +27,7 @@ export default function RankingPage() {
                         </a>
                     </Typography>
                 </Stack>
-                {
-                    isLoading && !error ? <Typography variant="body1" align="center">Loading...</Typography> :
-                        <RankingTable rows={rankings} />
-                }
+                <RankingTable rows={rankings} />
             </Stack>
         </Container>
     );
