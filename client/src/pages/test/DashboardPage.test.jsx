@@ -30,10 +30,7 @@ describe('loader', () => {
         const expectedData = { player: 'Ivan Lendl', slug: 'ivan-lendl' };
         mockApi.getPlayerDashboard.mockResolvedValue(expectedData);
         const res = await loader({ params: { slug: 'ivan-lendl' } });
-        expect(res).toEqual({
-            playerDashboard: expectedData,
-            players: mockPlayerList,
-        });
+        expect(res).toEqual({ playerDashboard: expectedData });
     });
 
     it('should return 404 if the player is not found', async () => {

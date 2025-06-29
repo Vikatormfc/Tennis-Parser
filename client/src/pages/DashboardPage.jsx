@@ -22,16 +22,13 @@ const tables = [
 
 export async function loader({ params }) {
     const api = new TennisParserApi();
-    const players = await api.listPlayers();
     if (!params.slug) {
+        const players = await api.listPlayers();
         return redirect(`/players/${players[0].slug}`);
     }
     const playerDashboard = await api.getPlayerDashboard(params.slug);
 
-    return {
-        playerDashboard,
-        players
-    };
+    return { playerDashboard };
 }
 
 export default function DashboardPage() {
