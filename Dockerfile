@@ -19,7 +19,7 @@ RUN apt-get update && \
 ENV PYTHONUNBUFFERED True
 
 COPY . ./
-COPY --from=builder /usr/src/app/dist ./client/
+COPY --from=builder /usr/src/app/dist ./client/dist
 
 ENV PORT 8000
 
