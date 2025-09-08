@@ -1,0 +1,1996 @@
+# SERVE/RETURN ANALYSIS
+import pandas as pd
+import numpy as np
+import re
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import Markdown, display
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing   import OneHotEncoder, PolynomialFeatures
+from sklearn.compose         import ColumnTransformer
+from sklearn.pipeline        import Pipeline
+from sklearn.linear_model    import LogisticRegression
+from lightgbm                import LGBMClassifier
+from sklearn.metrics         import roc_auc_score, log_loss, brier_score_loss
+import urllib.request, io, re
+import scipy.sparse as sp
+# 🗂 Data Loading & Initial Merge
+# This notebook cell-by-cell loads the point files, concatenates them, merges match metadata, and shows each DataFrame head rendered in Markdown for clarity.
+# %% [markdown]
+# ## 1) Load points from GitHub (MCP) + set PtWinner from the last token
+
+import pandas as pd
+import re
+import urllib.request
+
+# --- MCP GitHub raw URLs ---
+BASE = "https://raw.githubusercontent.com/JeffSackmann/tennis_MatchChartingProject/master/"
+points_urls = [
+    BASE + "charting-m-points-to-2009.csv",
+    BASE + "charting-m-points-2010s.csv",
+    BASE + "charting-m-points-2020s.csv",
+]
+# (for Block 2)
+matches_url = BASE + "charting-m-matches.csv"
+
+# ---- helpers ----
+def url_lines(url: str):
+    """Yield decoded lines from a GitHub raw URL."""
+    with urllib.request.urlopen(url) as r:
+        for b in r:
+            yield b.decode("utf-8", errors="replace")
+
+def pt_key(s: str) -> str:
+    """Canonicalize Pt for joins (digits only), so '57', '57.0', ' 57 ' all match."""
+    m = re.search(r"\d+", str(s))
+    return m.group(0) if m else ""
+
+def tail_ptwinner_map(url: str) -> pd.DataFrame:
+    """
+    Build a (match_id, Pt_key) -> PtWinner map from a raw file.
+    It grabs:
+      - match_id = text before the *first* comma
+      - Pt       = text between the 1st and 2nd comma (then canonicalized)
+      - PtWinner = text after the *last* comma
+    Robust to tabs/commas in 1st/2nd/Notes.
+    """
+    recs = []
+    for i, line in enumerate(url_lines(url)):
+        if i == 0 and line.lower().startswith("match_id"):  # skip header
+            continue
+        s = line.rstrip("\r\n").replace("\t", ",")
+        if not s: 
+            continue
+        c1 = s.find(",")
+        if c1 == -1:
+            continue
+        c2 = s.find(",", c1 + 1)
+        if c2 == -1:
+            continue
+        mid  = s[:c1].strip()
+        pt_k = pt_key(s[c1+1:c2].strip())
+        ptw  = s.rsplit(",", 1)[-1].strip()
+        recs.append((mid, pt_k, ptw))
+    df = pd.DataFrame(recs, columns=["match_id","Pt_key","PtWinner_tail"])
+    return df.drop_duplicates(["match_id","Pt_key"], keep="last")
+
+# 1) Read the three CSVs normally with pandas
+dfs = [pd.read_csv(u, dtype=str, engine="python") for u in points_urls]
+pts = pd.concat(dfs, ignore_index=True)
+pts = pts[pts["match_id"] != "match_id"].copy()  # defensive
+
+# 2) Overwrite PtWinner from the last token per line (joined on match_id + Pt_key)
+pts["match_id"] = pts["match_id"].astype(str).str.strip()
+pts["Pt_key"]   = pts["Pt"].astype(str).apply(pt_key)
+
+ptw_map = pd.concat([tail_ptwinner_map(u) for u in points_urls], ignore_index=True)
+ptw_map["match_id"] = ptw_map["match_id"].astype(str).str.strip()
+ptw_map["Pt_key"]   = ptw_map["Pt_key"].astype(str)
+
+# many-to-one merge guarantees we didn’t duplicate rows
+before_n = len(pts)
+pts = pts.merge(ptw_map, on=["match_id","Pt_key"], how="left", validate="many_to_one")
+assert len(pts) == before_n
+
+pts["PtWinner"] = pts["PtWinner_tail"].fillna(pts["PtWinner"]).astype(str).str.strip()
+pts.drop(columns=["Pt_key","PtWinner_tail"], inplace=True)
+
+# 3) Quick QA
+valid_pw = pts["PtWinner"].isin({"1","2"})
+print("Invalid PtWinner (expect ~0):", (~valid_pw).sum(), "/", len(pts))
+pts.head()
+
+# %% [markdown]
+# ## 2. Identify Server and Basic Flags + Metadata + Big 3 QA
+
+# 2.A matches lookup (names + metadata) — from GitHub (matches_url was set in Block 1)
+matches = pd.read_csv(matches_url, dtype=str, engine="python")
+matches["match_id"] = matches["match_id"].astype(str).str.strip()
+
+# --- Deduplicate on match_id to satisfy many_to_one merges (keep last occurrence) ---
+dup_ct = matches.duplicated("match_id", keep=False).sum()
+if dup_ct:
+    print(f"[warn] Duplicate match_id rows in matches: {dup_ct} → keeping last per match_id")
+matches = matches.sort_values("match_id").drop_duplicates("match_id", keep="last")
+
+# 2.B normalize TbSet & Svr to 0/1 ints
+pts["TbSet"] = pts["TbSet"].map(lambda v: 1 if str(v).strip().upper() in {"1","TRUE"} else 0).astype("uint8")
+pts["Svr"]   = pts["Svr"].map(lambda v: 1 if str(v).strip().upper() in {"1","TRUE"} else 0).astype("uint8")  # 1 ≙ Player1 served
+
+# 2.C overwrite player1/player2 from matches (MCP truth)
+name_map = matches[["match_id","Player 1","Player 2"]].rename(
+    columns={"Player 1":"player1","Player 2":"player2"}
+)
+pts["match_id"] = pts["match_id"].astype(str).str.strip()
+pts = (
+    pts.drop(columns=["player1","player2"], errors="ignore")
+       .merge(name_map, on="match_id", how="left", validate="many_to_one")
+)
+
+# 2.D per-point server/returner
+pts["server_name"]   = pts.apply(lambda r: r.player1 if r.Svr == 1 else r.player2, axis=1)
+pts["returner_name"] = pts.apply(lambda r: r.player2 if r.Svr == 1 else r.player1, axis=1)
+
+# 2.E merge metadata (Surface/Round/Time if present)
+meta_cols = ["match_id"] + [c for c in ["Surface","Round","Time"] if c in matches.columns]
+pts = pts.merge(matches[meta_cols], on="match_id", how="left", validate="many_to_one")
+
+# 2.F map server/returner hand
+hand_map = (
+    matches.rename(columns={"Player 1":"player1", "Player 2":"player2",
+                            "Pl 1 hand":"hand1",  "Pl 2 hand":"hand2"})
+           .melt(id_vars=["match_id","hand1","hand2"],
+                 value_vars=["player1","player2"],
+                 var_name="slot", value_name="player")
+           .assign(server_hand=lambda df: np.where(df["slot"].eq("player1"), df["hand1"], df["hand2"]))
+           .loc[:, ["match_id","player","server_hand"]]
+           .drop_duplicates(["match_id","player"], keep="last")
+)
+
+# server hand
+pts = pts.merge(
+    hand_map, left_on=["match_id","server_name"], right_on=["match_id","player"],
+    how="left", validate="many_to_one"
+).drop(columns="player")
+
+# returner hand
+ret_hand_map = hand_map.rename(columns={"player":"returner","server_hand":"returner_hand"})
+pts = pts.merge(
+    ret_hand_map, left_on=["match_id","returner_name"], right_on=["match_id","returner"],
+    how="left", validate="many_to_one"
+).drop(columns="returner")
+
+# 2.G validate PtWinner & derive winner/server_win
+pts["PtWinner"] = pts["PtWinner"].astype(str).str.strip()
+valid_pw        = pts["PtWinner"].isin({"1","2"})
+print(f"Points with invalid PtWinner (not '1' or '2'): {(~valid_pw).sum()} / {len(pts)}")
+if (~valid_pw).any():
+    print("Sample rows with invalid PtWinner:")
+    display(pts.loc[~valid_pw, ["match_id","Pt","PtWinner","1st","2nd","Notes"]].head(10))
+
+pts["winner_name"] = np.where(pts["PtWinner"].eq("1"), pts["player1"],
+                         np.where(pts["PtWinner"].eq("2"), pts["player2"], np.nan))
+pts["server_win"]  = (pts["winner_name"] == pts["server_name"]).astype("uint8")
+
+# 2.H Big-3 totals (independent of server)
+def to_p1_served(x): return str(x).strip().upper() in {"1","TRUE","T"}
+
+BIG3 = ["Novak Djokovic","Roger Federer","Rafael Nadal"]
+rows = []
+for name in BIG3:
+    sub = pts[((pts["player1"]==name) | (pts["player2"]==name)) & valid_pw].copy()
+    total = len(sub)
+    won   = int((sub["winner_name"] == name).sum())
+    pct   = won / total if total else np.nan
+
+    svr_p1  = sub["Svr"].map(to_p1_served)
+    p_is_p1 = (sub["player1"] == name)
+    me_srv  = np.where(svr_p1, p_is_p1, ~p_is_p1)
+    sp_pts  = int(me_srv.sum()); rp_pts = total - sp_pts
+    sp_won  = int(((sub["winner_name"] == name) & me_srv).sum())
+    rp_won  = int(((sub["winner_name"] == name) & (~me_srv)).sum())
+
+    rows.append({
+        "player": name,
+        "points_won_total": won,
+        "total_points_played": total,
+        "overall_point_win_pct": pct,
+        "serve_point_win_pct": (sp_won/sp_pts) if sp_pts else np.nan,
+        "return_point_win_pct": (rp_won/rp_pts) if rp_pts else np.nan,
+        "invalid_ptwinner_rows_excluded":
+            int(((pts["player1"]==name) | (pts["player2"]==name)).sum() - total),
+    })
+
+big3 = pd.DataFrame(rows).sort_values("overall_point_win_pct", ascending=False)
+display(big3[["player","points_won_total","total_points_played","overall_point_win_pct"]])
+display(big3[["player","serve_point_win_pct","return_point_win_pct","invalid_ptwinner_rows_excluded"]])
+
+# Global sanity
+print("Global server-win (valid rows only):", pts.loc[valid_pw, "server_win"].mean())
+first_pts = pts.sort_values(["match_id","Pt"]).groupby("match_id", as_index=False).head(1)
+print("Share Pt==1 with Svr==1:", first_pts["Svr"].astype(str).str.upper().isin(["1","TRUE","T"]).mean())
+
+# %% [markdown]
+# ### 4.C Diagnostic: List All Left-Handed Servers
+# Only Rafael Nadal appears because he is the only charted left-hander in this dataset.
+# Let's list all unique left-handed servers to confirm.
+lefty_players = pts.loc[pts["server_hand"] == "L", "server_name"].unique()
+print("Left-handed servers in dataset (unique):")
+for p in sorted(lefty_players):
+    print(f"- {p}")
+
+
+# ── Pressure-point flag ───────────────────────────────
+POINT_MAP = {"0": 0, "15": 1, "30": 2, "40": 3,"AD": 4, "A": 4, "Adv": 4, "adv": 4, "ADV": 4, "Advantage": 4}
+
+# ── Score bucket (server-centric) ──────────────────────────
+def make_score_bucket(r):
+    L, R = r.Pts.split("-")
+    return f"{L}-{R}" if r.Svr == 1 else f"{R}-{L}"
+
+if "score_bucket" not in pts.columns:
+    pts["score_bucket"] = pts.apply(make_score_bucket, axis=1)
+
+
+
+def _score_to_int(s):
+    """Return numeric value for any tennis score token."""
+    s = str(s).strip().upper()
+    if s in POINT_MAP:  # 0/15/30/40/AD variants
+        return POINT_MAP[s]
+    try:
+        return int(s)   # tiebreak numeric like '5'
+    except ValueError:
+        return np.nan
+
+def _is_tiebreak_row(r):
+    """Check if the row is a tiebreak point."""
+    if "TB?" in r.index:
+        tbq = str(r["TB?"]).strip().upper()
+        if tbq in {"1","TRUE","T"}:
+            return True
+    return bool(r.TbSet) and str(r.Gm1).strip() == "6" and str(r.Gm2).strip() == "6" #
+
+def pressure_pt(r):
+    # 1) Any tiebreak point is pressure
+    if _is_tiebreak_row(r):
+        return True
+
+    # 2) Parse game score tokens
+    try:
+        l_raw, r_raw = str(r.Pts).split("-")
+    except ValueError:
+        return False  # malformed score → not pressure
+
+    p1, p2 = _score_to_int(l_raw), _score_to_int(r_raw)
+
+    # 3) Symmetric pressure: 30–30 or 40–40 (deuce)
+    if p1 == p2 and p1 in (2, 3):
+        return True
+
+    # 4) Asymmetric pressure: server is trailing (break-point style)
+    #    Pts is in Player1–Player2 terms; Svr==1 means Player1 is serving.
+    if r.Svr:     # Player1 serving
+        return p1 < p2
+    else:         # Player2 serving
+        return p2 < p1
+
+pts["pressure_pt"] = pts.apply(pressure_pt, axis=1)
+
+
+
+# ───── 1. CONSTANTS & DATACLASS ─────
+@dataclass
+class Shot:
+    hitter: str
+    stroke: str
+    pos_mod: Optional[str] = None
+    net_cord: bool = False
+    sector: Optional[str] = None
+    err: str = ""
+    out: str = ""
+
+STROKE_LABEL = {
+    "f": "Forehand",  "b": "Backhand",
+    "s": "Backhand slice",  "r": "Forehand slice",
+    "v": "Forehand volley", "z": "Backhand volley",
+    "o": "Forehand overhead", "p": "Backhand overhead",
+    "u": "Forehand drop shot", "y": "Backhand drop shot",
+    "l": "Forehand lob", "m": "Backhand lob",
+    "h": "Forehand half-volley", "i": "Backhand half-volley",
+    "j": "Forehand swinging volley", "k": "Backhand swinging volley",
+    "t": "Tweener / trick shot", "q": "Unknown stroke",
+    "S": "Serve"
+}
+SERVE_DIR = {"4": "Wide", "5": "Body", "6": "Down-the-T", "0": "Unknown"}
+ERR_LABEL = {"n": "net", "w": "wide", "d": "deep", "x": "wide_deep",
+             "g": "foot fault", "!": "shank", "e": "unknown", "": ""}
+OUTCOME_LABEL = {"*": "Winner", "#": "Forced error",
+                 "@": "Unforced error", "": ""}
+SPECIAL_CODES = {
+    'S': 'Point to Server', 'R': 'Point to Returner',
+    'P': 'Point Penalty on Server','Q': 'Point Penalty on Returner',
+    'C': 'Incorrect Challenge',  'V': 'Time Violation on Serve'
+}
+
+
+# ───── 2. ROBUST PARSER ─────
+def parse_point(code: str) -> Tuple[Optional[str], List[Shot]]:
+    code = str(code).strip()
+    if not code:
+        return None, []
+    if code in SPECIAL_CODES:
+        return None, [Shot("System", code, err=SPECIAL_CODES[code])]
+    for sc, lbl in SPECIAL_CODES.items():
+        if code.endswith(sc):
+            return None, [Shot("System", sc, err=lbl)]
+
+    code = code.lstrip('c')  # strip lets
+
+    # serve token
+    dir_code, serve_pos_mod, rest = None, None, code
+    if code and code[0] in SERVE_DIR:
+        dir_code, rest = code[0], code[1:]
+        if rest.startswith("+"):
+            serve_pos_mod, rest = "+", rest[1:]
+
+    serve_err, serve_out = "", ""
+    if dir_code is None and len(rest) == 1 and rest in ERR_LABEL:
+        serve_err, rest = rest, ""
+    elif rest and len(rest) == 1:
+        if rest[0] in ERR_LABEL:
+            serve_err, rest = rest[0], ""
+        elif rest[0] in OUTCOME_LABEL:
+            serve_out, rest = rest[0], ""
+
+    shots: List[Shot] = [Shot("srv", "S", serve_pos_mod, False,
+                              dir_code, serve_err, serve_out)]
+
+    # rally tokens
+    server_turn, idx = False, 0
+    while idx < len(rest):
+        if rest[idx] not in STROKE_LABEL:
+            break
+        stroke = rest[idx]
+        next_idx = len(rest)
+        for i in range(idx+1, len(rest)):
+            if rest[i] in STROKE_LABEL:
+                next_idx = i
+                break
+
+        token = rest[idx+1:next_idx]
+        modifiers = re.findall(r'[;\+\-\=\^]', token)
+        digits    = "".join(re.findall(r'\d', token))
+        err       = "".join(re.findall(r'[nwdxge]', token))
+        outcome   = "".join(re.findall(r'[\*@#]', token))
+
+        shots.append(Shot(
+            hitter="srv" if server_turn else "ret",
+            stroke=stroke,
+            pos_mod=next((c for c in modifiers if c in "+-=^"), None),
+            net_cord=';' in modifiers,
+            sector=digits or None,
+            err=err.lower(),
+            out=outcome
+        ))
+
+        idx = next_idx
+        server_turn = not server_turn
+        if outcome:
+            break
+
+    return dir_code, shots
+Fixating who is a server that wins the point and who is the shooter who wins it
+# map PtWinner → actual player name
+pts["winner_name"] = np.where(pts["PtWinner"].astype(str).str.strip().eq("1"), pts["player1"],
+                              np.where(pts["PtWinner"].astype(str).str.strip().eq("2"), pts["player2"], np.nan))
+
+# did the server win this point?
+pts["server_win"] = (pts["server_name"] == pts["winner_name"]).astype("uint8")  # keeps 0/1
+
+
+# ───── 3. FLAG LOGIC ─────
+isUnret = "isUnret" in pts.columns  # define once, outside make_flags
+
+def make_flags(row):
+    shots = row["shots"]
+    if not shots:
+        return pd.Series({"is_ace": False, "is_unret": False, "is_sp1": False})
+
+    ace = (shots[0].out == '*')
+
+    if isUnret:
+        unret = bool(str(row.get("isUnret")).strip().upper() == "TRUE")
+    else:
+        # treat any failed return (forced # or unforced @) as unreturned serve
+        unret = (
+        (len(shots) == 1 and shots[0].out == "#") or
+        (len(shots) >= 2 and shots[1].hitter == "ret" and shots[1].out == "#")
+        )
+
+
+    sp1 = (
+        len(shots) == 3 and
+        shots[1].hitter == "ret" and shots[1].out == "" and
+        shots[2].hitter == "srv" and shots[2].out == "*"
+    )
+
+    return pd.Series({"is_ace": ace, "is_unret": unret, "is_sp1": sp1})
+
+def tag_return(row):
+    sh = row.shots
+    if len(sh) < 2:      # ace or unreturned
+        return pd.Series(dict(
+            rtn_played  = False,
+            rtn_winner  = False,
+            rtn_forced  = False,
+            rtn_unforce = False,
+            rtn_dir     = None
+        ))
+    rtn = sh[1]
+    return pd.Series(dict(
+        rtn_played  = True,
+        rtn_winner  = rtn.out == '*',
+        rtn_forced  = rtn.out == '#',
+        rtn_unforce = rtn.out == '@',
+        rtn_dir     = rtn.sector      # raw 1-9; map later if desired
+    ))
+
+
+
+# ───── 4. MAIN PIPELINE ─────
+
+# 1) extract raw rally code
+def extract_code(v):
+    s = str(v).strip()
+    return "" if s.lower()=="nan" or not s else s
+
+pts["raw_code"] = pts.apply(
+    lambda r: extract_code(r["2nd"]) or extract_code(r["1st"]),
+    axis=1
+)
+
+# 2) parse the full shots list
+pts["shots"] = pts["raw_code"].map(lambda c: parse_point(c)[1])
+
+# 3) compute serve flags (ace/unret/sp1)
+pts = pd.concat([pts, pts.apply(make_flags, axis=1)], axis=1)
+
+# 4) compute return flags (now that shots exists)
+pts = pd.concat([pts, pts.apply(tag_return, axis=1)], axis=1)
+
+def safe_point_side(row):
+    s = str(row["Pts"])
+    if "-" not in s:
+        return None  # malformed; skip
+    left, right = [t.strip().upper() for t in s.split("-", 1)]
+    try:
+        p1 = POINT_MAP.get(left, int(left))   # tiebreak numbers like '5'
+        p2 = POINT_MAP.get(right, int(right))
+    except ValueError:
+        return None
+    return "deuce" if (p1 + p2) % 2 == 0 else "ad"
+
+
+# ---------------------------------------------------------
+# H2  Tiny lexer for ONE serve attempt
+# ---------------------------------------------------------
+def lex_serve(token:str):
+    """
+    Return (dir_code, err_code, out_code).
+    Works for the short tokens found in `1st` or `2nd`.
+    """
+    token = str(token).strip()
+    if not token:
+        return None, "", ""
+
+    dir_code, err_code, out_code = None, "", ""
+    if token[0] in SERVE_DIR:           # 4/5/6/0
+        dir_code, token = token[0], token[1:]
+
+    # exactly one trailing symbol at most
+    if token and token[0] in ERR_LABEL:
+        err_code = token[0]
+    elif token and token[0] in OUTCOME_LABEL:
+        out_code = token[0]
+
+    return dir_code, err_code, out_code
+
+pts["side"] = pts.apply(safe_point_side, axis=1)
+
+pts[["dir1","err1","out1"]] = pts["1st"].map(lex_serve).tolist()
+pts[["dir2","err2","out2"]] = pts["2nd"].map(lex_serve).tolist()
+
+# ─── 3-A explode into serve_df ──────────────────────────
+
+
+
+records_serve = []
+for _, r in pts.iterrows():
+    start_on = 1 if r.err1 == "" else 2  # which serve attempt began the rally
+    # now r.server_name, r.shots, r.is_sp1, r.side, r.dir1… all exist
+    side    = r.side
+    surface = r.Surface
+    round_  = r.Round
+
+    # first serve
+    d1,e1,o1 = r.dir1, r.err1, r.out1
+    records_serve.append({
+        "match_id":  r.match_id,
+        "server":    r.server_name,
+        "server_hand": r.server_hand,
+        "returner_hand": r.returner_hand,
+        "score_bucket": r.score_bucket,
+        "pressure_pt":  r.pressure_pt,
+        "returner":  (r.player2 if r.server_name==r.player1 else r.player1),
+        "serve_num": 1,
+        "side":      side,
+        "surface":   surface,
+        "round":     round_,
+        "dir_code":  d1,
+        "err_code":  e1,
+        "out_code":  o1,
+        "ace":       (o1=="*"),
+        "unret":     (o1=="#") or (bool(r.rtn_forced) and start_on == 1),
+        "sp_plus1": (r.is_sp1 and start_on == 1)
+    })
+
+    # second serve if first was a fault
+    if e1:
+        d2,e2,o2 = r.dir2, r.err2, r.out2
+        records_serve.append({
+            **records_serve[-1],
+            "serve_num": 2,
+            "dir_code":  d2,
+            "err_code":  e2,
+            "out_code":  o2,
+            "ace":       (o2=="*"),
+            "unret":     (o2=="#") or (bool(r.rtn_forced) and start_on == 2),
+            "sp_plus1":  (r.is_sp1 and start_on == 2)
+        })
+
+serve_df = pd.DataFrame(records_serve)
+# ────────────────────────────────────────────────────────
+
+# ── 3-B Empirical Serve Efficiency by player + context ────────────
+serve_df["is_win"] = (serve_df["ace"] | serve_df["unret"] | serve_df["sp_plus1"]).astype(int)
+
+# group by server + the six dims you ship to the site
+empSE_df = (
+    serve_df
+      .groupby(
+          ["server",
+           "surface","side","serve_num","pressure_pt","returner_hand"],
+          observed=True
+      )
+      .agg(serves=("is_win","size"), wins=("is_win","sum"))
+      .reset_index()
+)
+
+# shrink toward the global mean
+mu = empSE_df["wins"].sum() / empSE_df["serves"].sum()
+m  = 30
+empSE_df["empSE_shrunk"] = (empSE_df["wins"] + m*mu) / (empSE_df["serves"] + m)
+
+# merge back only the shrunken SE and serve counts
+serve_df = serve_df.merge(
+    empSE_df[
+      ["server",
+       "surface","side","serve_num","pressure_pt","returner_hand",
+       "serves","empSE_shrunk"]
+    ],
+    on=["server","surface","side","serve_num","pressure_pt","returner_hand"],
+    how="left"
+)
+
+# Most-recent serves first
+serve_df = serve_df.sort_values("match_id", ascending=False)
+
+# quick peek
+serve_df.head(10)
+
+serve_df.to_csv("serve_stats.csv", index=False)
+pts[["raw_code","shots","is_ace","rtn_played","side","dir1","out1"]].head()
+
+# SERVE SUMMARY
+# ── 4-A Player summary for the Serve tab ───────────────────────────
+serve_summary = (
+    serve_df
+      .groupby("server")
+      .agg(
+        total_serves=("serve_num","size"),
+        total_aces  =("ace",      "sum"),
+        total_unret =("unret",    "sum"),
+        total_sp1   =("sp_plus1","sum")
+      )
+      .assign(
+        ace_rate   = lambda d: d.total_aces  / d.total_serves,
+        unret_rate = lambda d: d.total_unret / d.total_serves,
+        sp1_rate   = lambda d: d.total_sp1   / d.total_serves,
+        SE         = lambda d: d.ace_rate + d.unret_rate + d.sp1_rate
+      )
+)
+serve_summary.to_csv("serve_summary.csv")
+
+# ── 4-B Fine-grain cube for multi-layer slicing ────────────────────
+serve_cube = (
+    serve_df
+      .groupby(
+         ["server","surface","side","serve_num","pressure_pt","returner_hand"],
+         observed=True
+      )
+      .agg(
+        total_serves=("serve_num","size"),
+        total_aces  =("ace","sum"),
+        total_unret =("unret","sum"),
+        total_sp1   =("sp_plus1","sum")
+      )
+      .reset_index()
+      .assign(
+        ace_rate   = lambda d: d.total_aces  / d.total_serves,
+        unret_rate = lambda d: d.total_unret / d.total_serves,
+        sp1_rate   = lambda d: d.total_sp1   / d.total_serves,
+        SE         = lambda d: d.ace_rate + d.unret_rate + d.sp1_rate
+      )
+)
+serve_cube.to_csv("serve_cube.csv", index=False)
+
+# serve_cube table sorted by SE
+serve_summary_sorted = serve_summary.sort_values("SE", ascending=False)
+serve_summary_sorted.head(10)
+Pesquisando múltiplos jogadores
+players = ["Roger Federer", "Rafael Nadal", "Novak Djokovic", "Joao Fonseca"]
+
+# pick those rows…
+subset = serve_summary.loc[players]
+
+# …then sort by Serve Efficiency descending:
+subset_sorted = subset.sort_values("SE", ascending=False)
+
+subset_sorted
+
+
+Slice of a player in the ranking
+# 1) Define your threshold
+threshold = 1000
+
+# 2) Filter the fully-sorted table
+filtered = serve_summary[serve_summary["total_serves"] >= threshold]
+
+# 3) Now pick your player and window
+player = "Ivo Karlovic"
+window = 2
+
+# 4) Locate his position _within_ that filtered table
+pos = filtered.index.get_loc(player)
+
+# 5) Compute slice boundaries
+start = max(pos - window, 0)
+end   = pos + window + 1
+
+# 6) Show player ± window
+filtered.iloc[start:end]
+
+# ────────────────────────────────────────────────────────────────────
+# 1.  Decide the context dimensions you care about  ─────────────────
+#     (dir_code is now included)
+CTX_COLS = [
+    "server",          # ← row owner
+    "dir_code",        # serve direction 4/5/6/0
+    "surface",         # Clay / Grass / Hard
+    "side",            # deuce / ad
+    "serve_num",       # 1 = first serve, 2 = second
+    "pressure_pt",     # True / False
+    "returner_hand"    # L / R / NaN
+]
+
+# ────────────────────────────────────────────────────────────────────
+# 2.  Aggregate → compute rates → SE  ───────────────────────────────
+serve_cube_full = (
+    serve_df
+      .groupby(CTX_COLS, observed=True)       # observed=True = skip empty bins
+      .agg(
+          serves      = ("serve_num", "size"),     # total attempts
+          aces        = ("ace",       "sum"),
+          unreturned  = ("unret",     "sum"),
+          sp_plus1    = ("sp_plus1",  "sum"),
+      )
+      .assign(
+          ace_rate    = lambda d: d.aces       / d.serves,
+          unret_rate  = lambda d: d.unreturned / d.serves,
+          sp1_rate    = lambda d: d.sp_plus1   / d.serves,
+          SE          = lambda d: d.ace_rate + d.unret_rate + d.sp1_rate
+      )
+      .reset_index()           # keep it *long* for easy filtering on the site
+)
+
+# (optional) throw out rows with very small sample size
+serve_cube_full = serve_cube_full.query("serves >= 20")
+
+# ────────────────────────────────────────────────────────────────────
+# 3.  Export  ────────────────────────────────────────────────────────
+serve_cube_full.to_csv("serve_cube_dir.csv", index=False)
+# …or a binary format that loads faster:
+# serve_cube_full.to_parquet("serve_cube_dir.parquet")       
+
+# RETURNER EFFICIENCY
+# 2.1  server × returner table
+pair = (
+    serve_df
+      .groupby(["server", "returner"])
+      .agg(
+          plays = ("serve_num",  "size"),
+          ace   = ("ace",        "sum"),
+          unret = ("unret",      "sum"),
+          sp1   = ("sp_plus1",   "sum"),
+      )
+      .assign(
+          effpts  = lambda d: d.ace + d.unret + d.sp1,
+          SE_pair = lambda d: 100 * d.effpts / d.plays
+      )
+      #.drop(columns=["ace", "unret", "sp1"])          # optional
+)
+
+return_threshold = 1000
+#pair = pair[pair.plays >= return_threshold]
+
+
+# 2.2  server-level baseline
+base = (
+    serve_df
+      .groupby("server")
+      .agg(
+          plays = ("serve_num",  "size"),
+          ace   = ("ace",        "sum"),
+          unret = ("unret",      "sum"),
+          sp1   = ("sp_plus1",   "sum"),
+      )
+      .assign(
+          effpts  = lambda d: d.ace + d.unret + d.sp1,
+          SE_base = lambda d: 100 * d.effpts / d.plays
+      )
+      .loc[:, ["SE_base"]]                          # keep just the one column
+)
+
+# 2.3  drop-off table
+pair = pair.join(base, on="server")
+pair["DSE"] = pair.SE_base - pair.SE_pair
+
+# rebuild the per-returner table
+rtn_eff = (
+    pts.query("rtn_played")
+       .groupby("returner_name")               
+       .agg(
+           returns   = ("rtn_played", "size"),
+           winners   = ("rtn_winner", "sum"),
+           unforced  = ("rtn_unforce", "sum"),
+       )
+       .assign(
+           win_rate = lambda d: 100 * d.winners / d.returns,
+           err_rate = lambda d: 100 * d.unforced / d.returns   # ← only Unforced!
+       )
+       .query("returns >= 10000")          # ≥ ALTER HERE FOR FILTER BY NUMBER OF RETURNS
+       .sort_values(["win_rate", "err_rate"], ascending=[False, True])
+)
+
+print(rtn_eff.head(20).sort_values("err_rate", ascending=True))
+
+# mean DSE per returner (plays-weighted)
+return_rank_mean = (
+  pair
+    .reset_index()                       # bring returner back as a column
+    .groupby("returner")
+    .apply(lambda g: pd.Series({
+        "pairs_used":    g.shape[0],
+        "total_returns": g["plays"].sum(),
+        "DSE":           np.average(g["DSE"], weights=g["plays"])
+    }))
+    .reset_index()
+    .query("total_returns >= 1000")
+    .sort_values("DSE", ascending=False)
+)
+
+New Indicator: Drop in Serve Efficiency
+return_rank_mean
+
+# Testing DSE calculations
+import numpy as np
+import pandas as pd
+
+# We already have: serve_df with columns ['server','returner','match_id','is_win', ...]
+# If 'is_win' isn't present yet, run the line you had:
+# serve_df["is_win"] = (serve_df["ace"] | serve_df["unret"] | serve_df["sp_plus1"]).astype(int)
+
+# Pair- and base-level SE (same math as your DSE table)
+base = (serve_df.groupby("server", observed=True)["is_win"]
+                 .agg(wins="sum", plays="size")
+                 .assign(SE_base=lambda d: 100*d.wins/d.plays)
+                 [["SE_base"]])
+
+pair = (serve_df.groupby(["server","returner"], observed=True)["is_win"]
+                 .agg(wins="sum", plays="size")
+                 .assign(SE_pair=lambda d: 100*d.wins/d.plays)
+                 .join(base, on="server")
+                 .assign(DSE=lambda d: d.SE_base - d.SE_pair)
+                 .reset_index())
+
+def compare_on_common(returners):
+    sub = pair[pair["returner"].isin(returners)]
+    common_servers = (sub.groupby("server")["returner"].nunique()
+                        .pipe(lambda s: s[s == len(returners)]).index)
+    cmp = sub[sub["server"].isin(common_servers)]
+    out = (cmp.groupby("returner")
+             .apply(lambda g: pd.Series({
+                 "pairs_used_common": g.shape[0],
+                 "plays_common": int(g["plays"].sum()),
+                 "DSE_common": np.average(g["DSE"], weights=g["plays"])
+             }))
+             .reset_index()
+           )
+    return out.sort_values("DSE_common", ascending=False)
+
+print(compare_on_common(["Novak Djokovic","Carlos Alcaraz","Roger Federer"]))
+
+# Year from match_id
+serve_df["year"] = pd.to_numeric(serve_df["match_id"].str[:4], errors="coerce")
+
+base_y = (serve_df.groupby(["server","year"], observed=True)["is_win"]
+                  .agg(wins="sum", plays="size")
+                  .assign(SE_base_y=lambda d: 100*d.wins/d.plays)
+                  [["SE_base_y"]]
+                  .reset_index())
+
+pair_y = (serve_df.groupby(["server","returner","year"], observed=True)["is_win"]
+                  .agg(wins="sum", plays="size")
+                  .assign(SE_pair_y=lambda d: 100*d.wins/d.plays)
+                  .reset_index()
+                  .merge(base_y, on=["server","year"], how="left")
+                  .assign(DSE_y=lambda d: d.SE_base_y - d.SE_pair_y))
+
+dse_year_matched = (pair_y.groupby("returner")
+                           .apply(lambda g: pd.Series({
+                               "pairs_used_years": g[["server","year"]].drop_duplicates().shape[0],
+                               "plays": int(g["plays"].sum()),
+                               "DSE_year_matched": np.average(g["DSE_y"], weights=g["plays"])
+                           }))
+                           .reset_index()
+                           .sort_values("DSE_year_matched", ascending=False))
+
+dse_year_matched.query("returner in ['Novak Djokovic','Carlos Alcaraz','Roger Federer']").head(10)
+
+def top_pairs(returner, n=15):
+    return (pair[pair["returner"]==returner]
+            .sort_values("plays", ascending=False)
+            .assign(weight=lambda d: d["plays"]/d["plays"].sum(),
+                    contrib=lambda d: d["weight"]*d["DSE"])).head(n)[["server","plays","SE_base","SE_pair","DSE","weight","contrib"]]
+
+display(top_pairs("Novak Djokovic"))
+display(top_pairs("Carlos Alcaraz"))
+
+import numpy as np, pandas as pd
+
+TARGETS = ["Novak Djokovic","Carlos Alcaraz"]
+
+# Full-point baseline per server
+spw_base = (pts.groupby("server_name")["server_win"]
+              .agg(wins="sum", plays="size")
+              .assign(SPW_base=lambda d: 100*d.wins/d.plays))[["SPW_base"]]
+
+# Server × returner full-point SE, then DSE_full
+spw_pair = (pts.groupby(["server_name","returner_name"])["server_win"]
+              .agg(wins="sum", plays="size")
+              .assign(SPW_pair=lambda d: 100*d.wins/d.plays)
+              .join(spw_base, on="server_name")
+              .assign(DSE_full=lambda d: d.SPW_base - d.SPW_pair)
+              .reset_index()
+              .rename(columns={"server_name":"server","returner_name":"returner"}))
+
+panel_a = (spw_pair[spw_pair["returner"].isin(TARGETS)]
+           .groupby("returner")
+           .apply(lambda g: pd.Series({
+               "pairs_used": g.shape[0],
+               "plays": int(g["plays"].sum()),
+               "DSE_full": np.average(g["DSE_full"], weights=g["plays"])
+           })).reset_index())
+
+print("A) Full-point DSE (server point-win%):")
+print(panel_a.sort_values("DSE_full", ascending=False).to_string(index=False))
+
+pair_b = pair.reset_index()
+
+panel_b = (pair_b[pair_b["returner"].isin(TARGETS)]
+           .groupby("returner")
+           .apply(lambda g: pd.Series({
+               "pairs_used": g.shape[0],
+               "plays": int(g["plays"].sum()),
+               "avg_SE_base_faced": np.average(g["SE_base"], weights=g["plays"])
+           })).reset_index())
+
+print("\nB) Weighted average SE_base faced:")
+print(panel_b.sort_values("avg_SE_base_faced", ascending=False).to_string(index=False))
+
+pair_c = pair.reset_index().copy()
+pair_c = pair_c[pair_c["SE_base"] > 0]                    # avoid div-by-zero
+pair_c["supp_ratio"] = 1 - (pair_c["SE_pair"] / pair_c["SE_base"])
+
+panel_c = (pair_c[pair_c["returner"].isin(TARGETS)]
+           .groupby("returner")
+           .apply(lambda g: pd.Series({
+               "pairs_used": g.shape[0],
+               "plays": int(g["plays"].sum()),
+               "supp_ratio": np.average(g["supp_ratio"], weights=g["plays"])
+           })).reset_index())
+
+print("\nC) Early-phase suppression ratio (1 − SE_pair / SE_base):")
+print(panel_c.sort_values("supp_ratio", ascending=False).to_string(index=False))
+
+import numpy as np
+import pandas as pd
+
+TARGETS = ["Novak Djokovic","Carlos Alcaraz"]
+
+# 1) pair-level component counts (per server–returner)
+pair_comp = (
+    serve_df
+      .groupby(["server","returner"], observed=True)
+      .agg(plays=("serve_num","size"),
+           ace=("ace","sum"),
+           unret=("unret","sum"),
+           sp1=("sp_plus1","sum"))
+      .reset_index()
+)
+
+# 2) server baselines for each component – keep ONLY the rates to avoid suffixes
+base_comp = (
+    serve_df
+      .groupby("server", observed=True)
+      .agg(plays=("serve_num","size"),
+           ace=("ace","sum"),
+           unret=("unret","sum"),
+           sp1=("sp_plus1","sum"))
+      .assign(
+          ace_rate   = lambda d: 100 * d.ace   / d.plays,
+          unret_rate = lambda d: 100 * d.unret / d.plays,
+          sp1_rate   = lambda d: 100 * d.sp1   / d.plays
+      )[["ace_rate","unret_rate","sp1_rate"]]   # ← keep only rates
+      .reset_index()
+)
+
+# 3) join + pair rates + deltas
+pc = pair_comp.merge(base_comp, on="server", how="left")
+pc = pc.assign(
+    ace_pair   = lambda x: 100 * x["ace"]   / x["plays"],
+    unret_pair = lambda x: 100 * x["unret"] / x["plays"],
+    sp1_pair   = lambda x: 100 * x["sp1"]   / x["plays"],
+    d_ace      = lambda x: x["ace_rate"]    - x["ace_pair"],
+    d_unret    = lambda x: x["unret_rate"]  - x["unret_pair"],
+    d_sp1      = lambda x: x["sp1_rate"]    - x["sp1_pair"],
+)
+
+# 4) compact comparison table (no apply warning)
+def component_table(returner: str) -> pd.Series:
+    g = pc.loc[pc["returner"] == returner, ["server","plays","d_ace","d_unret","d_sp1"]].copy()
+    g["wDSE"] = g["d_ace"] + g["d_unret"] + g["d_sp1"]
+    out = (g.groupby(level=0)
+             .apply(lambda df: pd.Series()) )  # noop, just placeholder to avoid confusion
+    w = g["plays"].to_numpy(float)
+    return pd.Series({
+        "pairs_used": g["server"].nunique(),
+        "plays": int(w.sum()),
+        "Δace":   np.average(g["d_ace"],   weights=w),
+        "Δunret": np.average(g["d_unret"], weights=w),
+        "Δsp1":   np.average(g["d_sp1"],   weights=w),
+        "a-DSE":  np.average(g["wDSE"],    weights=w),
+    }, name=returner)
+
+# Print Djokovic vs Alcaraz
+res = pd.concat([component_table(t) for t in TARGETS], axis=1).T.round(3)
+print(res.sort_values("a-DSE", ascending=False).to_string(index=False))
+
+# ensure serve_df has the expected columns
+req = {"server","returner","ace","unret","sp_plus1","serve_num"}
+missing = req - set(serve_df.columns)
+assert not missing, f"serve_df missing columns: {missing}"
+
+def qa_unret_sources(returner):
+    sub = serve_df[serve_df["returner"] == returner].copy()
+    # infer mapping source
+    src = []
+    for _, r in sub.iterrows():
+        # serve-token unret if the out_code itself is '#'
+        if r["out_code"] == "#":
+            src.append("serve-token")
+        else:
+            # otherwise it came from shots[1] forced (#) mapped to the starting serve
+            src.append("return-token")
+    sub["unret_src"] = src
+    tbl = (sub.assign(unret_cnt=sub["unret"].astype(int))
+               .groupby("unret_src")["unret_cnt"].sum())
+    print(f"\nUnreturned serves by source – {returner}")
+    print(tbl)
+
+qa_unret_sources("Novak Djokovic")
+qa_unret_sources("Carlos Alcaraz")
+
+def dse_vs_threshold(returner, mins=(0,100,250,500,1000,2000)):
+    base = (serve_df.groupby("server")
+                   .agg(SE_base=("is_win", lambda s: 100*s.mean()),
+                        plays=("is_win","size")))
+    pair = (serve_df[serve_df["returner"]==returner]
+                   .groupby("server")
+                   .agg(SE_pair=("is_win", lambda s: 100*s.mean()),
+                        plays_pair=("is_win","size")))
+    j = pair.join(base, how="inner")
+    for m in mins:
+        jj = j[j["plays_pair"] >= m]
+        w = jj["plays_pair"]
+        dse = np.average(jj["SE_base"] - jj["SE_pair"], weights=w) if len(jj) else np.nan
+        print(f"{returner:16s} min-pairs {m:4d}  servers={len(jj):3d}  plays={int(w.sum()):7d}  DSE={dse:6.3f}")
+
+dse_vs_threshold("Novak Djokovic")
+dse_vs_threshold("Carlos Alcaraz")
+
+def component_breakdown(returner):
+    base = (serve_df.groupby(["server","serve_num"])
+             .agg(plays=("is_win","size"),
+                  ace_rate=("ace","mean"),
+                  unret_rate=("unret","mean"),
+                  sp1_rate=("sp_plus1","mean"))
+             .assign(ace_rate=lambda d:100*d.ace_rate,
+                     unret_rate=lambda d:100*d.unret_rate,
+                     sp1_rate=lambda d:100*d.sp1_rate))
+    pair = (serve_df[serve_df["returner"]==returner]
+             .groupby(["server","serve_num"])
+             .agg(plays_pair=("is_win","size"),
+                  ace=("ace","sum"),
+                  unret=("unret","sum"),
+                  sp1=("sp_plus1","sum"))
+             .assign(ace_pair=lambda d:100*d.ace/d.plays_pair,
+                     unret_pair=lambda d:100*d.unret/d.plays_pair,
+                     sp1_pair=lambda d:100*d.sp1/d.plays_pair))
+    j = pair.join(base, how="inner")
+    j["w"] = j["plays_pair"]
+    for k in ["ace","unret","sp1"]:
+        j[f"d_{k}"] = j[f"{k}_rate"] - j[f"{k}_pair"]
+    out = j.groupby("serve_num").apply(
+        lambda g: pd.Series({
+            "servers": g.shape[0],
+            "plays": int(g["w"].sum()),
+            "Δace": np.average(g["d_ace"],   weights=g["w"]),
+            "Δunret": np.average(g["d_unret"], weights=g["w"]),
+            "Δsp1": np.average(g["d_sp1"],   weights=g["w"]),
+        })
+    )
+    print(f"\nComponent deltas by serve number – {returner}")
+    print(out.round(3))
+
+component_breakdown("Novak Djokovic")
+component_breakdown("Carlos Alcaraz")
+
+# DIFFERENT DSE CALCULATIONS 
+Empirical-Bayes - Component DSE (your “a-DSE”: ace + unret + S+1)
+# 1) baselines per (server, serve_num)
+base = (serve_df
+        .groupby(["server","serve_num"])
+        .agg(plays_s=("is_win","size"),
+             ace_s=("ace","sum"),
+             unret_s=("unret","sum"),
+             sp1_s=("sp_plus1","sum"))
+        .assign(p_ace_s   = lambda d: d.ace_s   / d.plays_s,
+                p_unret_s = lambda d: d.unret_s / d.plays_s,
+                p_sp1_s   = lambda d: d.sp1_s   / d.plays_s))
+
+# 2) pair stats
+pair = (serve_df
+        .groupby(["server","returner","serve_num"])
+        .agg(plays=("is_win","size"),
+             ace=("ace","sum"),
+             unret=("unret","sum"),
+             sp1=("sp_plus1","sum"))
+        .reset_index())
+
+# 3) join & Empirical-Bayes shrink toward server baselines
+m = 400  # shrinkage strength (tunable; 200–600 works well)
+j = pair.merge(base.reset_index(), on=["server","serve_num"], how="left")
+
+for comp, s_mean in [("ace","p_ace_s"), ("unret","p_unret_s"), ("sp1","p_sp1_s")]:
+    j[f"p_{comp}_pair"]  = j[comp] / j["plays"]
+    # posterior mean of pair rate with Beta–Binomial prior centered on server mean
+    j[f"p_{comp}_post"]  = (j[comp] + m*j[s_mean]) / (j["plays"] + m)
+    # delta = baseline − pair (positive means the returner reduced the server’s rate)
+    j[f"d_{comp}"]       = 100*(j[s_mean] - j[f"p_{comp}_post"])
+
+# 4) information weight (tiny pairs get little mass; no hard threshold)
+j["w_eff"] = j["plays"] * (j["plays"] / (j["plays"] + m))
+
+# 5) returner-level a-DSE (component deltas summed, weighted)
+j["d_sum"] = j["d_ace"] + j["d_unret"] + j["d_sp1"]
+aDSE = (j.groupby("returner")
+          .apply(lambda g: pd.Series({
+              "pairs_used":    g.shape[0],
+              "plays":         int(g["plays"].sum()),
+              "aDSE":          np.average(g["d_sum"], weights=g["w_eff"]),
+              "Δace":          np.average(g["d_ace"], weights=g["w_eff"]),
+              "Δunret":        np.average(g["d_unret"], weights=g["w_eff"]),
+              "Δsp1":          np.average(g["d_sp1"], weights=g["w_eff"]),
+          }))
+          .reset_index()
+          .sort_values("aDSE", ascending=False))
+aDSE
+Full-point DSE
+# point-level server win already exists as pts["server_win"] (0/1 int)
+# build server baselines per (server, serve_num)
+svr_pts = pts.copy()
+svr_pts["serve_num"] = np.where(svr_pts["err1"].fillna("")=="", 1, 2)
+
+baseP = (svr_pts.groupby(["server_name","serve_num"])
+         .agg(plays_s=("server_win","size"),
+              win_s=("server_win","sum"))
+         .assign(p_s = lambda d: d.win_s / d.plays_s)
+         .rename_axis(index={"server_name":"server"})
+         .reset_index())
+
+pairP = (svr_pts.groupby(["server_name","returner_name","serve_num"])
+         .agg(plays=("server_win","size"),
+              win=("server_win","sum"))
+         .rename_axis(index={"server_name":"server","returner_name":"returner"})
+         .reset_index())
+
+mP = 600  # slightly larger shrink for full-point stability
+jj = pairP.merge(baseP, on=["server","serve_num"], how="left")
+jj["p_pair"] = jj["win"] / jj["plays"]
+jj["p_post"] = (jj["win"] + mP*jj["p_s"]) / (jj["plays"] + mP)
+jj["d_full"] = 100*(jj["p_s"] - jj["p_post"])
+jj["w_eff"]  = jj["plays"] * (jj["plays"] / (jj["plays"] + mP))
+
+DSE_full = (jj.groupby("returner")
+              .apply(lambda g: pd.Series({
+                  "pairs_used": g.shape[0],
+                  "plays": int(g["plays"].sum()),
+                  "DSE_full": np.average(g["d_full"], weights=g["w_eff"]),
+              }))
+              .reset_index()
+              .sort_values("DSE_full", ascending=False))
+DSE_full
+Mixed-effects model
+# RETURN + 1
+# ─── RETURN + 1 RANKING ────────────────────────────────────────────────────
+
+def is_return_plus1(shots):
+    """
+    shots[0] = serve (srv)
+    shots[1] = return (ret)
+    We count RP1 if EITHER:
+      A) len == 3 and last shot is server forced error '#'
+      B) len == 4 and last shot is returner winner '*'
+    Everything else → not RP1.
+    """
+    if not shots or len(shots) < 3:
+        return False
+
+    # A) Immediate server forced error on their first rally shot
+    if len(shots) == 3 and shots[-1].hitter == "srv" and shots[-1].out == "#":
+        return True
+
+    # B) Returner hits a winner on their next ball
+    if len(shots) == 4 and shots[-1].hitter == "ret" and shots[-1].out == "*":
+        return True
+
+    return False
+
+# Ensure we only evaluate on points where a return was actually played
+pts["rtn_plus1"] = pts.apply(
+    lambda r: bool(r.rtn_played) and is_return_plus1(r.shots),
+    axis=1
+)
+
+pts["rtn_plus1"] = pts.apply(
+  lambda r: r.rtn_played and is_return_plus1(r.shots), axis=1
+)
+
+rp1_rank = (
+  pts.groupby("returner_name")
+     .agg(
+       returns = ("rtn_played","sum"),
+       rp1_pts = ("rtn_plus1","sum"),
+     )
+     .query("returns >= 10000")
+     .assign(rp1_rate = lambda d: 100*d.rp1_pts/d.returns)
+     .sort_values("rp1_rate", ascending=False)
+)
+
+print(f"Top 20 Return + 1 performers")
+print(rp1_rank.head(20))
+
+# RP1 must be a subset of returns
+assert ((pts["rtn_plus1"] == 1) & (pts["rtn_played"] == 0)).sum() == 0
+
+# Should never collide with immediate-serve outcomes
+if "is_unret" in pts.columns:
+    assert ((pts["rtn_plus1"] == 1) & (pts["is_unret"] == 1)).sum() == 0
+if "is_ace" in pts.columns:
+    assert ((pts["rtn_plus1"] == 1) & (pts["is_ace"] == 1)).sum() == 0
+
+print("RP1 share among returns:",
+      round(100 * pts.loc[pts["rtn_played"] == 1, "rtn_plus1"].mean(), 3), "%")
+
+# RETURN DIRECTION
+# Cell 1 – RETURN DIRECTION  
+# This cell computes the return direction and other return stats
+
+if "err1" not in pts.columns:
+    pts[["dir1","err1","out1"]] = pts["1st"].map(lex_serve).tolist()
+    pts[["dir2","err2","out2"]] = pts["2nd"].map(lex_serve).tolist()
+return_rows = []
+for _, r in pts.iterrows():
+
+    # skip aces / unreturned serves
+    if not r.rtn_played:
+        continue
+
+    rtn = r.shots[1]                     # first shot by returner
+
+    # ------- split the two-digit sector code -------
+    sec = rtn.sector or ""               # "", "8", "17", …
+    lat = sec[0] if len(sec) >= 1 else None      # 1-6  (lateral)
+    dep = sec[1] if len(sec) >= 2 else None      # 7/8/9 (depth)
+    # ----------------------------------------------
+
+    # first-serve return unless the first serve carried an error code
+    serve_num = 1 if r.err1 == "" else 2
+
+    return_rows.append({
+        "match_id" : r.match_id,
+        "returner" : r.player2 if r.server_name == r.player1 else r.player1,
+        "server"   : r.server_name,
+        "serve_num": serve_num,
+        "side"     : r.side,
+        "surface"  : r.Surface,
+        "round"    : r.Round,
+        "lat_sec"  : lat,
+        "dep_sec"  : dep,
+        "winner"   : rtn.out == "*",
+        "unforced" : rtn.out == "@",
+    })
+
+return_df = pd.DataFrame(return_rows)
+
+# Cell 2 – RETURN DIRECTION (label the two axes)
+
+LATERAL_MAP = {
+    "1": "fh_corner",      # right-hander’s FH / lefty BH
+    "2": "middle",
+    "3": "bh_corner",
+    "4": "wide",
+    "5": "body",
+    "6": "T"
+}
+
+DEPTH_MAP = {
+    "7": "shallow",
+    "8": "deep",
+    "9": "very_deep"
+}
+
+return_df["lat_bin"]   = return_df.lat_sec.map(LATERAL_MAP).fillna("unk")
+return_df["depth_bin"] = return_df.dep_sec.map(DEPTH_MAP).fillna("unk")
+
+# Cell 3 – RETURN DIRECTION (% table with both dimensions)
+depth_order = ["shallow", "deep", "very_deep", "unk"]
+
+rtn_dir_pct = (
+    return_df
+      .groupby([
+          "returner", "serve_num", "side", "surface",
+          "lat_bin", "depth_bin"              # ← two-level column index
+      ])
+      .size()
+      .groupby(level=[0,1,2,3])               # total per (player,serve,side,surface)
+      .apply(lambda s: 100*s/s.sum())         # convert to %
+      .unstack(fill_value=0)
+      .reindex(depth_order, axis = 1)                                # columns = lat × depth
+)
+
+# example slice: Novak Djokovic, vs 1st serves, deuce side, all surfaces
+rtn_dir_pct.xs(("Novak Djokovic", 1, "deuce"), level=[0,1,2])
+
+# Cell 4 – RETURN DIRECTION (player-specific % table)
+player_return_query = (
+    return_df.query("returner == 'Novak Djokovic'")
+             .groupby(["lat_bin", "depth_bin"])
+             .size()
+)
+
+pct_global = 100 * player_return_query / player_return_query.sum()        # ONE denominator
+pct_global = (
+    pct_global.unstack(fill_value=0)
+              .reindex(depth_order, axis=1)     # keep column order
+)
+
+pct_global.index = (
+    pd.MultiIndex.from_product(
+        [["Novak Djokovic"], pct_global.index],   # top = player, 2nd = lat_bin
+        names=["player", "lat_bin"]
+    )
+)
+
+pct_global
+
+Full table
+rtn_dir_pct = rtn_dir_pct.reindex(depth_order, axis=1, level=1)
+rtn_dir_pct
+RANKING VERY-DEEP RETURNS
+
+
+# ─── PARAMETERS ───
+MIN_RETURNS = 10000     # only keep players with ≥ this many returns
+DEPTH_FILTER = "very_deep"    # which depth to rank on
+LAT_ORDER = ["bh_corner","fh_corner","middle","unk"]
+
+# ─── 1. Totals per player ───
+tot = (
+    return_df
+      .groupby("returner")
+      .size()
+      .rename("total_returns")
+)
+
+# ─── 2. Subset to the target depth ───
+vd = return_df[return_df.depth_bin == DEPTH_FILTER]
+
+# 2a) count of very_deep returns per player
+tot_vd = vd.groupby("returner").size().rename(f"{DEPTH_FILTER}_count")
+
+# 2b) breakdown of those very_deep by lat_bin
+vd_lat = (
+    vd.groupby(["returner","lat_bin"])
+      .size()
+      .unstack(fill_value=0)
+      .reindex(columns=LAT_ORDER, fill_value=0)
+)
+
+# ─── 3. Assemble into one DataFrame ───
+rank_df = pd.concat([tot, tot_vd, vd_lat], axis=1).fillna(0)
+
+# ─── 4. Compute percentages of ALL returns ───
+rank_df[f"{DEPTH_FILTER}_pct"] = 100 * rank_df[f"{DEPTH_FILTER}_count"] / rank_df["total_returns"]
+for lat in LAT_ORDER:
+    rank_df[f"{DEPTH_FILTER}_{lat}_pct"] = 100 * rank_df[lat] / rank_df["total_returns"]
+
+# ─── 5. Filter by minimum returns ───
+rank_df = rank_df[rank_df["total_returns"] >= MIN_RETURNS]
+
+# ─── 6. Sort by the metric you care about ───
+#    e.g. percent of *all* returns that were very_deep+middle:
+rank_df = rank_df.sort_values(f"{DEPTH_FILTER}_middle_pct", ascending=False)
+
+# ─── 7. Select & display columns ───
+cols = [
+    "total_returns",
+    f"{DEPTH_FILTER}_count", f"{DEPTH_FILTER}_pct"
+] + [f"{DEPTH_FILTER}_{lat}_pct" for lat in LAT_ORDER]
+
+print(rank_df[cols].head(20))
+
+# ERA ANALYSIS 
+Cell 1 – Parse helpers
+# --- final outcome of each point ------------------------------------------
+def get_final_out(shots):
+    """Return last Shot.out code (* # @) or None if shots missing."""
+    if not isinstance(shots, list) or not shots:
+        return None
+    return shots[-1].out
+
+# --- volley / net helpers --------------------------------------------------
+NET_STROKES = set("vzophijkuy")        # volley, overhead, half-volley, etc.
+
+def went_to_net(shots):
+    """True if ANY volley-family stroke appears after the serve."""
+    if not isinstance(shots, list):
+        return False
+    return any(s.stroke in NET_STROKES for s in shots[1:])
+
+def is_sv_point(shots):
+    """True if server’s 1st ground-stroke is a volley-family stroke."""
+    if not isinstance(shots, list) or len(shots) < 3:
+        return False
+    first_ground = shots[2]
+    return first_ground.hitter == "srv" and first_ground.stroke in NET_STROKES
+
+Cell 2 – Add point-level flags to pts
+# rally length (serve excluded); NaN if shots bad
+pts["rally_len"] = pts["shots"].map(
+    lambda s: len(s) - 1 if isinstance(s, list) else pd.NA
+)
+
+# final outcome flags
+pts["final_out"]   = pts["shots"].map(get_final_out)
+pts["is_winner"]   = pts["final_out"] == "*"
+pts["is_forced"]   = pts["final_out"] == "#"
+pts["is_unforced"] = pts["final_out"] == "@"
+
+# net & serve-volley flags
+pts["to_net"]  = pts["shots"].map(went_to_net)
+pts["is_sv"]   = pts["shots"].map(is_sv_point)
+
+# breakpoint flags (return-side)
+sb = pts["score_bucket"].str.upper()
+pts["is_bp"] = sb.isin({"0-40", "15-40", "30-40", "40-AD"})
+pts["bp_won_flag"] = pts["is_bp"] & (pts["winner_name"] == pts["returner_name"])
+
+
+# season column
+pts["year"] = pts["match_id"].str.slice(0, 4).astype(int)
+
+Cell 3 – Yearly aggregation table yearly
+yearly = (
+    pts.dropna(subset=["rally_len"])
+       .groupby("year")
+       .agg(
+           pts_total      = ("rally_len", "size"),
+           pct_net        = ("to_net",   "mean"),
+           pct_sv         = ("is_sv",    "mean"),
+           mean_rally     = ("rally_len","mean"),
+           pct_win        = ("is_winner","mean"),
+           pct_forced     = ("is_forced","mean"),
+           pct_unforced   = ("is_unforced","mean"),
+       )
+       .assign(   # convert proportions → %
+           pct_net      = lambda d: 100*d.pct_net,
+           pct_sv       = lambda d: 100*d.pct_sv,
+           pct_win      = lambda d: 100*d.pct_win,
+           pct_forced   = lambda d: 100*d.pct_forced,
+           pct_unforced = lambda d: 100*d.pct_unforced,
+       )
+)
+
+yearly.tail()
+
+Cell 4 – Plot yearly trends
+
+plt.figure()
+plt.plot(yearly.index, yearly["pct_net"], label="% net-points")
+plt.plot(yearly.index, yearly["pct_sv"],  label="% serve-volley")
+plt.xlabel("Season"); plt.ylabel("% of points"); plt.title("Net & S&V trends")
+plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure()
+plt.plot(yearly.index, yearly["mean_rally"])
+plt.xlabel("Season"); plt.ylabel("Shots per rally")
+plt.title("Average Rally Length by Season")
+plt.tight_layout(); plt.show()
+
+plt.figure()
+plt.stackplot(
+    yearly.index,
+    yearly["pct_win"], yearly["pct_forced"], yearly["pct_unforced"],
+    labels=["Winners","Forced Err","Unforced Err"]
+)
+plt.xlabel("Season"); plt.ylabel("% of points")
+plt.title("Point-ending outcomes by Season")
+plt.legend(); plt.tight_layout(); plt.show()
+
+# ─── separate curves for winner / forced / unforced ────────────────
+# optional smoothing window (set SMOOTH=1 to disable)
+SMOOTH = 3          # 3-year rolling mean
+yr = yearly.copy()
+
+if SMOOTH > 1:
+    yr = yr.rolling(SMOOTH, min_periods=1).mean()
+
+plt.figure(figsize=(8,4))
+plt.plot(yr.index, yr["pct_win"],   label="% Winners")
+plt.plot(yr.index, yr["pct_forced"],label="% Forced Errors")
+plt.plot(yr.index, yr["pct_unforced"], label="% Unforced Errors")
+plt.xlabel("Season")
+plt.ylabel("% of points")
+plt.title(f"Point-ending outcomes by Season (smoothed {SMOOTH}y)")
+plt.legend(frameon=False)
+plt.tight_layout()
+plt.show()
+By analysing the graphs, I decided to define eras pre 1990, 1990-2010, post 2010
+def era_of(y: int) -> str:
+    if y < 1990:   return "pre-1990"
+    if y < 2011:   return "1990-2010"
+    return "post-2010"
+
+era_order = ["pre-1990", "1990-2010", "post-2010"]
+era_dtype = pd.api.types.CategoricalDtype(era_order, ordered=True)
+
+pts["era"] = pts["year"].map(era_of).astype(era_dtype)
+
+Cell 6 – Era-level summary era_tbl
+era_tbl = (
+    pts.dropna(subset=["rally_len"])
+       .groupby("era", observed=True)   # observed=True drops empty eras
+       .agg(
+           pts_total      = ("rally_len", "size"),
+           pct_net        = ("to_net",    "mean"),
+           pct_sv         = ("is_sv",     "mean"),
+           mean_rally     = ("rally_len", "mean"),
+           pct_win        = ("is_winner", "mean"),
+           pct_forced     = ("is_forced", "mean"),
+           pct_unforced   = ("is_unforced","mean"),
+           bp_total       = ("is_bp",     "sum"),
+           bp_won         = ("bp_won_flag","sum"),
+       )
+       .assign(
+           pct_net      = lambda d: 100*d.pct_net,
+           pct_sv       = lambda d: 100*d.pct_sv,
+           pct_win      = lambda d: 100*d.pct_win,
+           pct_forced   = lambda d: 100*d.pct_forced,
+           pct_unforced = lambda d: 100*d.pct_unforced,
+           bp_conv      = lambda d: 100*d.bp_won/d.bp_total,
+       )
+       .loc[:, ["pts_total","pct_net","pct_sv","mean_rally",
+                "pct_win","pct_forced","pct_unforced","bp_conv"]]
+)
+
+print(era_tbl)
+
+# ════════════════════════════════════════════════════════════════════════
+# A)  Winner-to-Unforced ratio
+# ════════════════════════════════════════════════════════════════════════
+SMOOTH = 3                                 # rolling window in seasons
+yr_ratio = yearly.copy()
+yr_ratio["win_unf_ratio"] = yr_ratio["pct_win"] / yr_ratio["pct_unforced"]
+
+if SMOOTH > 1:
+    yr_ratio["win_unf_ratio"] = (
+        yr_ratio["win_unf_ratio"].rolling(SMOOTH, min_periods=1).mean()
+    )
+
+plt.figure(figsize=(8,4))
+plt.plot(yr_ratio.index, yr_ratio["win_unf_ratio"])
+plt.xlabel("Season"); plt.ylabel("W / UF ratio")
+plt.title(f"Winner-to-Unforced ratio by Season (smoothed {SMOOTH}y)")
+plt.tight_layout(); plt.show()
+
+Net-play % by surface
+
+# 1) Keep only the real court types
+GOOD_SURF = {"Clay", "Grass", "Hard"}
+pts["Surface"] = pts["Surface"].where(pts["Surface"].isin(GOOD_SURF), other=pd.NA)
+
+# 2) Re-aggregate net-play share per year × surface
+surf_year = (
+    pts.dropna(subset=["Surface"])
+       .groupby(["year", "Surface"])["to_net"]
+       .mean()
+       .mul(100)
+       .reset_index(name="pct_net")
+)
+
+# 3) Plot
+COLOR_MAP = {
+    "Clay":   "orange",
+    "Grass":  "green",
+    "Hard":   "blue"
+}
+fig, ax = plt.subplots(figsize=(8,4))
+for surf in GOOD_SURF:
+    sub = surf_year[surf_year.Surface == surf]
+    ax.plot(sub.year, sub.pct_net, label=surf, color=COLOR_MAP[surf])
+ax.set_xlabel("Season")
+ax.set_ylabel("% of points reaching the net")
+ax.set_title("Net-play trend by surface")
+ax.legend(frameon=False)
+plt.tight_layout()
+plt.show()
+
+Return + 1 ranking per era
+# reusing rtn_plus1 flag from earlier answer
+def is_return_plus1(shots):
+    if not isinstance(shots, list):
+        return False
+    if len(shots) == 3:                   # forced error by server
+        return shots[-1].hitter == "srv" and shots[-1].out == "#"
+    if len(shots) == 4:                   # winner by returner
+        return shots[-1].hitter == "ret" and shots[-1].out == "*"
+    return False
+
+pts["rtn_plus1"] = pts.apply(
+    lambda r: r.rtn_played and is_return_plus1(r.shots), axis=1
+)
+
+rp1_era = (
+    pts.groupby(["era", "returner_name"])
+       .agg( returns=("rtn_played","sum"), rp1=("rtn_plus1","sum") )
+       .query("returns >= 1")
+       .assign(rp1_rate=lambda d: 100*d.rp1/d.returns)
+       .sort_values(["era","rp1_rate"], ascending=[True,False])
+)
+
+for e in rp1_era.index.get_level_values(0).unique():
+    print(f"\n=== Top 10 Return + 1 – {e} ===")
+    print(rp1_era.xs(e).head(10)[["rp1_rate"]])
+
+Pressure-point rally length per era
+# pressure flag: break points OR score 30-30/deuce/AD in a non-TB game
+pr_len = (pts[pts["pressure_pt"]]
+            .groupby("era")["rally_len"]
+            .mean()
+            .rename("mean_rally_pressure"))
+
+print("\nAverage rally length on pressure points:")
+print(pr_len)
+
+Rally Count by years
+# 1. create 5-year bins (e.g. 1960-64, 1965-69, …)
+pts["year_bin"] = (pts["year"] // 5) * 5       # e.g. 1997 → 1995
+pts["yr_span"]  = pts["year_bin"].astype(str) + "-" + (pts["year_bin"]+4).astype(str)
+
+# 2. use the full dataset (or sample if desired)
+pts_sampled = pts
+
+# 3. determine the sorted order of bins:
+yr_order = sorted(pts_sampled["yr_span"].unique(),
+                  key=lambda s: int(s.split("-")[0]))
+
+# append an asterisk to any bin that is in the future
+# (here, if the starting year >= 2025, we assume the full window hasn't passed yet)
+labels = [lab + "*" if int(lab.split("-")[0]) >= 2025 else lab for lab in yr_order]
+
+# 4. plot box-plot using the sorted order and new labels
+plt.figure(figsize=(10,5))
+sns.boxplot(
+    data=pts_sampled,
+    x="yr_span", y="rally_len",
+    order=yr_order,
+    color="#1f77b4",
+    showfliers=False
+)
+plt.xticks(ticks=range(len(yr_order)), labels=labels, rotation=60, ha="right")
+plt.xlabel("5-year window")
+plt.ylabel("Rally length (shots excl. serve)")
+plt.title("Distribution of rally length every 5 years")
+plt.tight_layout()
+plt.show()
+
+# Other Studies
+Global constants & helper flags
+# =========  GLOBAL SETTINGS  ================
+YEAR_MIN      = 1985          # keep rallies from this season onward
+ERA_FILTER    = None          # e.g. "post-2010" or None for all
+MIN_SLICE     = 50            # slice ranking threshold
+MIN_DROP      = 40            # drop-shot ranking threshold
+SLICE_CODES   = {"s","r"}     # BH slice 's', FH slice 'r'
+DROP_CODES    = {"y","u"}     # BH drop 'y', FH drop 'u'
+VOLLEY_CODES  = {"v","z","o","p","h","i","j","k"} 
+# ============================================
+
+
+# -- build per-point helper columns once ----------------------------------
+pts["year"]  = pts["match_id"].str.slice(0,4).astype(int)
+pts["era"]   = pts["year"].map(era_of)      # era_of you already defined
+pts["rally_len"] = pts["shots"].map(lambda s: len(s)-1 if isinstance(s,list) else pd.NA)
+
+
+
+# build serve_num once (KeyError fix)
+pts["serve_num"] = np.where(pts["err1"].fillna("") == "", 1, 2)
+
+
+Shot-level dataframe
+# explode shots for YEAR_MIN+
+rows = []
+for _, r in pts.query("year >= @YEAR_MIN").iterrows():
+    srv = r.player1 if r.Svr else r.player2
+    rtn = r.player2 if r.Svr else r.player1
+    for idx, s in enumerate(r.shots or []):
+        rows.append({
+            "match_id":   r.match_id,
+            "year":       r.year,
+            "era":        r.era,
+            "surface":    r.Surface,
+            "stroke":     s.stroke,
+            "shot_idx":   idx,
+            "player":     srv if s.hitter=="srv" else rtn,
+            "final_winner": r.player1 if r.PtWinner=="1" else r.player2,
+            "pressure_pt": r.pressure_pt,
+        })
+shot_df = pd.DataFrame(rows)
+
+# filter rally shots once
+rally_shots = shot_df[shot_df.shot_idx > 0]
+if ERA_FILTER:
+    rally_shots = rally_shots.query("era == @ERA_FILTER")
+
+Yearly slice / drop trends
+# ---- yearly slice %
+slice_year = (
+    rally_shots.assign(is_slice = rally_shots.stroke.isin(SLICE_CODES))
+               .groupby("year")["is_slice"].mean().mul(100)
+)
+plt.figure(figsize=(8,4))
+plt.plot(slice_year.index, slice_year, color="green")
+plt.title("Slice frequency by season") 
+plt.show()
+
+# ---- yearly drop %
+drop_year = (
+    rally_shots.assign(is_drop = rally_shots.stroke.isin(DROP_CODES))
+               .groupby("year")["is_drop"].mean().mul(100)
+)
+plt.figure(figsize=(8,4)); ...
+plt.plot(drop_year.index, drop_year, color="purple")
+plt.title("Drop-shot frequency by season") 
+plt.show()
+# BUILDING PLAYER DASHBOARD
+BLOCK A · helper columns
+# ── helper to map PtWinner ↦ actual player name ―――――――――――――――――――
+def winner_name(row):
+    return row.player1 if row.PtWinner == "1" else row.player2
+
+def loser_name(row):
+    return row.player2 if row.PtWinner == "1" else row.player1
+
+pts["winner_name"] = pts.apply(winner_name, axis=1)
+pts["loser_name"]  = pts.apply(loser_name,  axis=1)
+
+# did the server win this point?
+pts["server_win"] = pts["winner_name"] == pts["server_name"]
+
+# explode shots for YEAR_MIN+  (unchanged)
+rows = []
+for _, r in pts.query("year >= @YEAR_MIN").iterrows():
+    srv = r.player1 if r.Svr else r.player2
+    rtn = r.player2 if r.Svr else r.player1
+    for idx, s in enumerate(r.shots or []):
+        rows.append({
+            "match_id"   : r.match_id,
+            "year"       : r.year,
+            "era"        : r.era,
+            "surface"    : r.Surface,
+            "stroke"     : s.stroke,
+            "shot_idx"   : idx,
+            "player"     : srv if s.hitter == "srv" else rtn,
+            "final_winner": winner_name(r),          # NEW
+            "pressure_pt": r.pressure_pt,
+        })
+shot_df = pd.DataFrame(rows)
+
+# flag for “did THIS stroke’s striker win the rally?”
+shot_df["win_point"] = shot_df["player"] == shot_df["final_winner"]
+
+# keep only rally strokes (idx ≥ 1) and optional era filter
+rally_shots = shot_df[shot_df.shot_idx > 0]
+if ERA_FILTER:
+    rally_shots = rally_shots.query("era == @ERA_FILTER")
+
+# ==============================================================
+# PLAYER ANALYTICS  –  one self-contained block
+# ==============================================================
+
+
+# --------------------------------------------------------------
+# ── 0.  CONSTANTS
+# --------------------------------------------------------------
+MIN_TOTAL_PTS = 300
+MIN_SLICE = 50
+MIN_DROP  = 25
+SLICE_CODES = {"s","r"}
+DROP_CODES  = {"y","u"}
+QUAL_CODES  = SLICE_CODES | DROP_CODES
+NET_CODES   = {"v","z","o","p","h","i","j","k"}      # volleys-family
+
+# --------------------------------------------------------------
+# ── 1.  Slice / Drop attempt-scanner (full scan, corrected)
+# --------------------------------------------------------------
+rec_slice, rec_drop = [], []
+
+for _, r in pts.iterrows():
+    shots = r.shots or []
+    if len(shots) < 3:                # need serve + return + 1
+        continue
+
+    name = lambda tag: r.player1 if (tag=="srv") == r.Svr else r.player2
+
+    for i, sh in enumerate(shots[2:], start=2):          # start at idx 2
+        if sh.stroke not in QUAL_CODES:
+            continue
+
+        hitter = name(sh.hitter)
+        ok = False
+
+        # idx itself winner *
+        if sh.out == "*":
+            ok = True
+
+        # idx+1  opponent error (# or @)
+        if i+1 < len(shots):
+            nxt = shots[i+1]
+            if nxt.hitter != sh.hitter and nxt.out in {"#","@"}:
+                ok = True
+
+        # idx+2  hitter winner *   (NOT #)
+        if i+2 < len(shots):
+            nxt2 = shots[i+2]
+            if nxt2.hitter == sh.hitter and nxt2.out == "*":
+                ok = True
+
+        tgt = rec_slice if sh.stroke in SLICE_CODES else rec_drop
+        tgt.append({"player": hitter, "succ": ok})
+
+# helper → success table
+def eff_tbl(rec, min_n):
+    return (pd.DataFrame(rec)
+              .groupby("player")
+              .agg(plays=("succ","size"), succ=("succ","sum"))
+              .query("plays >= @min_n")
+              .assign(eff_pct=lambda d: 100*d.succ/d.plays))
+
+slice_eff  = eff_tbl(rec_slice, MIN_SLICE)
+drop_eff   = eff_tbl(rec_drop,  MIN_DROP)
+
+# --------------------------------------------------------------
+# ── 2.  Pressure-vs-normal win %  +  rally average  +  net use
+# --------------------------------------------------------------
+# build a long format: one row per player per point
+long_pts = (
+    pts.melt(
+        id_vars=["match_id","pressure_pt","to_net","rally_len","winner_name"],
+        value_vars=["player1","player2"],
+        var_name="player_role",
+        value_name="player"
+    )
+    .assign(win=lambda df: df.player == df.winner_name)
+)
+
+# aggregate per player
+point_tbl = (
+    long_pts.groupby("player")
+        .agg(
+            plays       = ("match_id","size"),
+            wins        = ("win","sum"),
+            press_plays = ("pressure_pt","sum"),
+            press_wins  = ("win", lambda s: (s & long_pts.loc[s.index,"pressure_pt"]).sum()),
+            net_plays   = ("to_net","sum"),
+            net_wins    = ("win", lambda s: (s & long_pts.loc[s.index,"to_net"]).sum()),
+            rally_avg   = ("rally_len","mean"),
+        )
+        .assign(
+            win_pct       = lambda d: 100*d.wins/d.plays,
+            press_win_pct = lambda d: 100*d.press_wins/d.press_plays,
+            net_use_pct   = lambda d: 100*d.net_plays/d.plays,
+            net_win_pct   = lambda d: 100*d.net_wins/d.net_plays,
+        )
+)
+
+
+# --------------------------------------------------------------
+# ── 3.  Offense / Defense / Consistency  (*rallies >= 4 only*)
+# --------------------------------------------------------------
+long_pts = pts.query("rally_len >= 4 and final_out.isin(['*','@'])")
+long_pts["winner_name"] = np.where(long_pts.PtWinner=="1", long_pts.player1, long_pts.player2)
+
+od = (
+    long_pts.groupby("winner_name")
+            .size().rename("winners")              # offense
+    .to_frame()
+    .join(long_pts.query("final_out=='@'")
+                   .groupby("winner_name")
+                   .size().rename("unforced"), how="outer")
+    .fillna(0)
+)
+od["plays"]     = od.winners + od.unforced
+od["win_rate"]  = 100*od.winners / od.plays
+od["ue_rate"]   = 100*od.unforced / od.plays.replace(0, np.nan)
+od["cons_ratio"]= od.win_rate / od.ue_rate.replace(0, np.nan)
+
+# --------------------------------------------------------------
+# ── 4.  Bring in previously-built serve / return tables
+# --------------------------------------------------------------
+# (serve_stats, return_stats, rp1_stats were already produced
+#  from earlier cells – we just re-use them here.)
+serve_stats = (
+    serve_df
+      .groupby("server")
+      .agg(
+        serve_total    = ("serve_num","size"),
+        serve_aces     = ("ace",      "sum"),
+        serve_unret    = ("unret",    "sum"),
+        serve_sp1      = ("sp_plus1", "sum")
+      )
+      .assign(
+        serve_ace_rate   = lambda d: 100*d.serve_aces  / d.serve_total,
+        serve_unret_rate = lambda d: 100*d.serve_unret / d.serve_total,
+        serve_sp1_rate   = lambda d: 100*d.serve_sp1   / d.serve_total,
+        serve_SE         = lambda d:  d.serve_ace_rate
+                               + d.serve_unret_rate
+                               + d.serve_sp1_rate
+      )
+)
+
+
+
+return_stats = (
+    pts.query("rtn_played")
+       .groupby("returner_name")
+       .agg(
+         ret_total    = ("rtn_played","size"),
+         ret_wins     = ("rtn_winner","sum"),
+         ret_unf      = ("rtn_unforce","sum")
+       )
+       .assign(
+         ret_win_rate = lambda d: 100*d.ret_wins / d.ret_total,
+         ret_err_rate = lambda d: 100*d.ret_unf  / d.ret_total
+       )
+)
+
+
+
+
+rp1_stats = (
+    pts.groupby("returner_name")
+       .agg(
+         rp1_total = ("rtn_played","sum"),
+         rp1_pts   = ("rtn_plus1","sum")
+       )
+       .assign(
+         rp1_rate = lambda d: 100*d.rp1_pts / d.rp1_total
+       )
+)
+# --------------------------------------------------------------
+# ── 5.  Assemble the dashboard
+# --------------------------------------------------------------
+idx = pd.Index(
+  sorted(set(
+    serve_stats.index
+    ) | set(return_stats.index)
+    | set(rp1_stats.index)
+    | set(point_tbl.index)
+    | set(od.index)
+    | set(slice_eff.index)
+    | set(drop_eff.index)
+  ),
+  name="player"
+)
+
+dash = (
+    serve_stats.reindex(idx)
+      .join(return_stats      .reindex(idx))
+      .join(rp1_stats         .reindex(idx))
+      .join(point_tbl         .reindex(idx))
+      .join(od[['win_rate','ue_rate','cons_ratio']].reindex(idx))
+      .join(slice_eff[['plays','eff_pct']].rename(columns=
+             {"plays":"slice_plays","eff_pct":"slice_eff"}).reindex(idx))
+      .join(drop_eff [['plays','eff_pct']].rename(columns=
+             {"plays":"drop_plays","eff_pct":"drop_eff"}).reindex(idx))
+      .fillna(0)
+)
+
+# filter low-sample players if you like
+dash = dash.query("plays >= @MIN_TOTAL_PTS")
+
+print(dash.head())
+
+# save
+dash.to_csv("player_dashboard.csv")
+
+Query of players
+# List of player names you want to see (edit as needed)
+players = [
+    "Roger Federer",
+    "Rafael Nadal",
+    "Novak Djokovic",
+    "Joao Fonseca"
+]
+
+# Check which of your queried players exist in the DataFrame
+missing = [p for p in players if p not in dash.index]
+if missing:
+    print("Warning: The following players are not present in the dashboard:", missing)
+
+# Query dashboard stats for those who exist
+subset = dash.loc[[p for p in players if p in dash.index]]
+
+# Sort by a main indicator (example: Serve Efficiency or Consistency Ratio)
+# Change 'serve_SE', 'win_pct', 'cons_ratio', etc. as you like
+subset_sorted = subset.sort_values("cons_ratio", ascending=False)
+
+# Display the result (all columns)
+pd.set_option('display.max_columns', None)  # show all columns if wide
+print(subset_sorted)
